@@ -30,38 +30,19 @@ result on a live map with an LLM chat panel for situational reasoning.
 
 ## What it does, end to end
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│              FRONTEND (Vite + Google Maps JavaScript API)            │
-│   live flood-zone overlays · sensor markers · evacuation routes ·    │
-│   risk heatmap · phase indicator · LLM chat panel                    │
-└────────────────────────────┬─────────────────────────────────────────┘
-                             │ WebSocket  (phase updates, sensor reads,
-                             │             flood forecasts, alerts)
-                             ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│              BACKEND (FastAPI + LangGraph + Pydantic)                │
-│                                                                      │
-│   REST   /api/v1/*       WebSocket  /ws/flood      OAuth  /auth/*    │
-│                                                                      │
-│   ┌──────────────────────────────────────────────────────────────┐   │
-│   │             FloodOps Orchestrator (LangGraph)                │   │
-│   │   7-phase state machine + LLM reasoning layer                │   │
-│   └────────────┬──────────────┬─────────────────┬────────────────┘   │
-│                │              │                 │                    │
-│        ┌───────▼───┐   ┌──────▼──────┐   ┌──────▼──────────────┐    │
-│        │ 8 Agents  │   │ 10 External │   │ Google Workspace    │    │
-│        │           │   │  Connectors │   │ Sheets · Drive ·    │    │
-│        │ Sentinel  │   │             │   │ Gmail               │    │
-│        │ GLOF      │   │ NOAA · USGS │   │                     │    │
-│        │ Predict   │   │ Sentinel    │   │ + Gemini LLM        │    │
-│        │ Urban     │   │ ECMWF · OSM │   │                     │    │
-│        │ Alert     │   │ WorldPop    │   │                     │    │
-│        │ Resource  │   │ HydroSHEDS  │   │                     │    │
-│        │ Disease   │   │ GLIMS · CCI │   │                     │    │
-│        │ Orchestr. │   │ Dartmouth   │   │                     │    │
-│        └───────────┘   └─────────────┘   └─────────────────────┘    │
-└──────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph FE["FRONTEND — Vite + Google Maps JavaScript API"]
+        FEUI["live flood-zone overlays · sensor markers · evacuation routes<br/>risk heatmap · phase indicator · LLM chat panel"]
+    end
+    subgraph BE["BACKEND — FastAPI + LangGraph + Pydantic"]
+        API["REST /api/v1/*  ·  WebSocket /ws/flood  ·  OAuth /auth/*"]
+        API --> ORCH["FloodOps Orchestrator (LangGraph)<br/>7-phase state machine + LLM reasoning layer"]
+        ORCH --> AGENTS["<b>8 Agents</b><br/>Sentinel · GLOF · Predict · Urban<br/>Alert · Resource · Disease · Orchestrator"]
+        ORCH --> CONN["<b>10 External Connectors</b><br/>NOAA · USGS · Sentinel · ECMWF · OSM<br/>WorldPop · HydroSHEDS · GLIMS · CCI · Dartmouth"]
+        ORCH --> GW["<b>Google Workspace + Gemini</b><br/>Sheets · Drive · Gmail · Gemini LLM"]
+    end
+    FEUI <-->|"WebSocket — phase updates, sensor reads,<br/>flood forecasts, alerts"| API
 ```
 
 ---
@@ -325,6 +306,27 @@ flood_multi-agent_system/
 ```
 
 ---
+
+## Quickstart
+
+```bash
+git clone https://github.com/krishddd/floodops-multi-agent-system
+cd floodops-multi-agent-system
+docker compose up          # full local demo — zero API keys required
+```
+
+Backend comes up on `http://localhost:8000`, frontend on `http://localhost:5173`.
+Every connector and the LLM fall back to deterministic mocks until you add keys,
+so the system boots and demos with nothing configured. Add live data by dropping
+keys into `.env` (see *Setup & credentials* below).
+
+Without Docker:
+
+```bash
+pip install -r backend/requirements.txt
+uvicorn floodops.main:app --reload      # backend
+cd frontend && npm install && npm run dev   # frontend
+```
 
 ## Setup & credentials
 
