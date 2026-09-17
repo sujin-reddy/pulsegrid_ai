@@ -1,230 +1,283 @@
-"""PulseGrid AI — Streamlit Operational Dashboard.
+"""PulseGrid AI — Autonomous Self-Healing Infrastructure Dashboard.
 
-Interactive control room for monitoring grid telemetry, triggering LangGraph
-anomaly workflows, inspecting local LLM (Qwen 2.5) reasoning, and executing interventions.
+Interactive Streamlit interface showcasing real-time agent workflow execution,
+local LLM root-cause analysis, and persistent SQLite memory.
 """
 
 from __future__ import annotations
 
+import sqlite3
 import pandas as pd
 import streamlit as st
 
-from db_memory import get_past_interventions, init_db
-from graph import run_pulsegrid_workflow
+from db_memory import DB_PATH, init_db
+from main import run_pipeline
 
-# Initialize DB on startup
+# Ensure database is initialized
 init_db()
 
-# Page configuration
+# Page Configuration
 st.set_page_config(
-    page_title="PulseGrid AI — Grid Resilience Agent",
+    page_title="PulseGrid AI — Autonomous Self-Healing Infrastructure",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS for modern dark-mode aesthetic
+# Custom Styling for Control Room Aesthetics
 st.markdown(
     """
     <style>
-    .main {
+    .stApp {
         background-color: #0b0f19;
     }
-    .metric-box {
+    .metric-card {
         background: linear-gradient(135deg, rgba(30, 41, 59, 0.7) 0%, rgba(15, 23, 42, 0.8) 100%);
         border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 12px;
+        border-radius: 10px;
         padding: 16px;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-    }
-    .badge-normal {
-        color: #10b981;
-        font-weight: 700;
-        background: rgba(16, 185, 129, 0.15);
-        padding: 4px 10px;
-        border-radius: 6px;
+        margin-bottom: 12px;
     }
     .badge-alert {
         color: #ef4444;
-        font-weight: 700;
-        background: rgba(239, 68, 68, 0.15);
+        background-color: rgba(239, 68, 68, 0.15);
+        border: 1px solid #ef4444;
         padding: 4px 10px;
         border-radius: 6px;
+        font-weight: 700;
+        display: inline-block;
     }
-    .agent-card {
-        border-left: 4px solid #3b82f6;
+    .badge-ok {
+        color: #10b981;
+        background-color: rgba(16, 185, 129, 0.15);
+        border: 1px solid #10b981;
+        padding: 4px 10px;
+        border-radius: 6px;
+        font-weight: 700;
+        display: inline-block;
+    }
+    .info-card {
         background: #1e293b;
-        padding: 16px;
-        border-radius: 0 10px 10px 0;
-        margin-bottom: 12px;
+        border-left: 4px solid #3b82f6;
+        padding: 14px;
+        border-radius: 0 8px 8px 0;
+        margin-bottom: 10px;
+    }
+    .action-card {
+        background: #1e293b;
+        border-left: 4px solid #10b981;
+        padding: 14px;
+        border-radius: 0 8px 8px 0;
+        margin-bottom: 10px;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# Sidebar: Telemetry controls
-st.sidebar.title("⚡ PulseGrid AI Control")
-st.sidebar.markdown("**Autonomous Grid Multi-Agent System**")
-st.sidebar.caption("LangGraph + Ollama (`qwen2.5`) + SQLite")
 
-st.sidebar.subheader("📡 Telemetry Scenario")
-preset = st.sidebar.selectbox(
-    "Choose Preset Scenario",
+def get_raw_database_entries() -> list[dict]:
+    """Fetch all raw records directly from interventions.db."""
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, anomaly_type, action_taken, outcome_score, timestamp FROM intervention_memory ORDER BY id DESC")
+        return [dict(row) for row in cursor.fetchall()]
+
+
+# Header
+st.title("⚡ PulseGrid AI — Autonomous Self-Healing Infrastructure")
+st.caption("LangGraph Multi-Agent Orchestration • Local Qwen 2.5 Reasoner • SQLite Persistent Memory")
+
+# Sidebar Controls
+st.sidebar.header("🎛️ Telemetry Input Parameters")
+st.sidebar.markdown("Configure incoming sensor stream for agent monitoring:")
+
+sensor_val = st.sidebar.slider(
+    "Sensor Value (Severity Metric)",
+    min_value=0,
+    max_value=100,
+    value=85,
+    help="Threshold is 80. Values > 80 trigger an automated anomaly investigation.",
+)
+
+anomaly_type = st.sidebar.selectbox(
+    "Simulated Anomaly Category",
     [
-        "Nominal Grid State",
-        "Undervoltage Sag & Low PF",
-        "Feeder Thermal Overload",
-        "Frequency Decay Event",
-        "Custom Manual Inputs",
+        "thermal_overload",
+        "voltage_sag",
+        "frequency_decay",
+        "transformer_overheat",
+        "reactive_power_deficit",
     ],
+    help="Select the specific grid physical disturbance pattern.",
 )
 
-substation = st.sidebar.text_input("Substation ID", value="SUB-CENTRAL-01")
+substation_id = st.sidebar.text_input("Substation Identifier", value="SUB-CENTRAL-04")
 
-if preset == "Nominal Grid State":
-    v_val, f_val, l_val, pf_val, t_val = 230.4, 60.01, 115.0, 0.96, 42.0
-elif preset == "Undervoltage Sag & Low PF":
-    v_val, f_val, l_val, pf_val, t_val = 214.2, 59.95, 145.0, 0.83, 62.0
-elif preset == "Feeder Thermal Overload":
-    v_val, f_val, l_val, pf_val, t_val = 227.0, 59.98, 174.0, 0.92, 88.5
-elif preset == "Frequency Decay Event":
-    v_val, f_val, l_val, pf_val, t_val = 222.0, 59.72, 162.0, 0.88, 54.0
+# Map anomaly category to realistic physical parameters
+if anomaly_type == "thermal_overload":
+    voltage = 226.5
+    temperature = 84.0 if sensor_val > 80 else 48.0
+    load_mw = 172.0 if sensor_val > 80 else 125.0
+    freq = 59.98
+    pf = 0.93
+elif anomaly_type == "voltage_sag":
+    voltage = 212.0 if sensor_val > 80 else 230.2
+    temperature = 52.0
+    load_mw = 145.0
+    freq = 59.96
+    pf = 0.82 if sensor_val > 80 else 0.95
+elif anomaly_type == "frequency_decay":
+    voltage = 224.0
+    temperature = 50.0
+    load_mw = 158.0
+    freq = 59.72 if sensor_val > 80 else 60.01
+    pf = 0.91
+elif anomaly_type == "transformer_overheat":
+    voltage = 229.0
+    temperature = 88.0 if sensor_val > 80 else 46.0
+    load_mw = 160.0
+    freq = 60.00
+    pf = 0.94
 else:
-    v_val = st.sidebar.slider("Voltage (kV)", 200.0, 250.0, 230.0, 0.5)
-    f_val = st.sidebar.slider("Frequency (Hz)", 59.0, 61.0, 60.0, 0.05)
-    l_val = st.sidebar.slider("Load (MW)", 50.0, 200.0, 120.0, 1.0)
-    pf_val = st.sidebar.slider("Power Factor", 0.70, 1.00, 0.95, 0.01)
-    t_val = st.sidebar.slider("Transformer Temp (°C)", 20.0, 110.0, 45.0, 1.0)
+    voltage = 222.0
+    temperature = 55.0
+    load_mw = 140.0
+    freq = 59.95
+    pf = 0.81 if sensor_val > 80 else 0.96
 
-run_button = st.sidebar.button("🚀 Run PulseGrid Workflow", type="primary", use_container_width=True)
-
-# Main Header
-st.title("⚡ PulseGrid AI — Smart Grid Resilience Orchestrator")
-st.markdown(
-    "Autonomous monitoring, root-cause diagnosis via **Qwen 2.5**, and memory-augmented intervention dispatching."
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Current Threshold:** `80.0`")
+st.sidebar.markdown(
+    f"**Status Preview:** "
+    + ("<span class='badge-alert'>ANOMALOUS (>80)</span>" if sensor_val > 80 else "<span class='badge-ok'>NOMINAL (<=80)</span>"),
+    unsafe_allow_html=True,
 )
 
-# Real-Time Telemetry Display
-st.subheader("📊 Substation Telemetry Readings")
-col1, col2, col3, col4, col5 = st.columns(5)
+run_simulation = st.sidebar.button("🚀 Run Simulation", type="primary", use_container_width=True)
 
-v_status = "badge-normal" if 218.5 <= v_val <= 241.5 else "badge-alert"
-f_status = "badge-normal" if 59.8 <= f_val <= 60.2 else "badge-alert"
-l_status = "badge-normal" if l_val <= 165.0 else "badge-alert"
-pf_status = "badge-normal" if pf_val >= 0.90 else "badge-alert"
-t_status = "badge-normal" if t_val <= 80.0 else "badge-alert"
+# Session state management for simulation results
+if "pipeline_result" not in st.session_state:
+    st.session_state.pipeline_result = None
 
-with col1:
-    st.metric("Bus Voltage", f"{v_val:.1f} kV", delta=f"{v_val - 230.0:+.1f} kV vs 230kV")
-    st.markdown(f"<span class='{v_status}'>Limit: 218.5 - 241.5 kV</span>", unsafe_allow_html=True)
-with col2:
-    st.metric("Frequency", f"{f_val:.2f} Hz", delta=f"{f_val - 60.00:+.2f} Hz vs 60Hz")
-    st.markdown(f"<span class='{f_status}'>Limit: 59.8 - 60.2 Hz</span>", unsafe_allow_html=True)
-with col3:
-    st.metric("Feeder Load", f"{l_val:.1f} MW", delta=f"{l_val / 180 * 100:.0f}% Cap")
-    st.markdown(f"<span class='{l_status}'>Max: 165.0 MW</span>", unsafe_allow_html=True)
-with col4:
-    st.metric("Power Factor", f"{pf_val:.2f}", delta=f"{pf_val - 0.95:+.2f}")
-    st.markdown(f"<span class='{pf_status}'>Min: 0.90</span>", unsafe_allow_html=True)
-with col5:
-    st.metric("Core Temp", f"{t_val:.1f} °C", delta=f"{t_val - 45.0:+.1f} °C")
-    st.markdown(f"<span class='{t_status}'>Alarm: > 80.0 °C</span>", unsafe_allow_html=True)
-
-st.divider()
-
-# Session State for Workflow Results
-if "workflow_result" not in st.session_state:
-    st.session_state.workflow_result = None
-
-if run_button:
-    current_telemetry = {
-        "substation_id": substation,
-        "voltage_kv": float(v_val),
-        "frequency_hz": float(f_val),
-        "load_mw": float(l_val),
-        "power_factor": float(pf_val),
-        "temperature_c": float(t_val),
+if run_simulation:
+    input_telemetry = {
+        "substation_id": substation_id,
+        "value": float(sensor_val),
+        "anomaly_type": anomaly_type,
+        "voltage_kv": voltage,
+        "temperature_c": temperature,
+        "load_mw": load_mw,
+        "frequency_hz": freq,
+        "power_factor": pf,
     }
-    with st.spinner("Executing LangGraph Agent Workflow (Monitoring ➔ Investigating ➔ Intervening)..."):
-        result = run_pulsegrid_workflow(current_telemetry)
-        st.session_state.workflow_result = result
-    st.success("Workflow cycle completed!")
 
-# Workflow output visualization
-if st.session_state.workflow_result:
-    res = st.session_state.workflow_result
+    with st.spinner("⚡ Executing PulseGrid Multi-Agent Pipeline (Monitor ➔ Investigate ➔ Intervene)..."):
+        res = run_pipeline(input_telemetry)
+        st.session_state.pipeline_result = res
+    st.success("Simulation completed successfully!")
+
+# Display Results across 3 Columns
+if st.session_state.pipeline_result is not None:
+    res = st.session_state.pipeline_result
     anomaly_detected = res.get("anomaly_detected", False)
     status = res.get("status", "complete")
+    root_cause = res.get("root_cause", "No anomaly identified.")
+    proposed = res.get("proposed_intervention", {})
+    past_actions = res.get("past_interventions", [])
+    messages = res.get("messages", [])
 
-    st.subheader("🤖 LangGraph Agent Workflow Execution")
+    col1, col2, col3 = st.columns(3)
 
-    # Workflow Status Bar
-    wcol1, wcol2, wcol3, wcol4 = st.columns(4)
-    with wcol1:
-        st.info("1. **Monitor Node**\nThresholds & limits evaluation")
-    with wcol2:
+    # -------------------------------------------------------------
+    # Column 1: Telemetry & Detection Status
+    # -------------------------------------------------------------
+    with col1:
+        st.subheader("1️⃣ Telemetry & Detection")
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <h3>Sensor Metric: {sensor_val} / 100</h3>
+                <p>Threshold Limit: <b>80.0</b></p>
+                <p>Detection Status: {'<span class="badge-alert">⚠️ ANOMALY DETECTED</span>' if anomaly_detected else '<span class="badge-ok">✅ NOMINAL OPERATION</span>'}</p>
+                <p>Workflow Phase: <code>{status.upper()}</code></p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("**Real-Time Telemetry Payload:**")
+        st.json(res.get("telemetry_data", {}))
+
+    # -------------------------------------------------------------
+    # Column 2: Root Cause Analysis & Evidence
+    # -------------------------------------------------------------
+    with col2:
+        st.subheader("2️⃣ Root Cause Analysis")
         if anomaly_detected:
-            st.warning("2. **Investigate Node**\nQwen2.5 Root Cause Diagnosis")
-        else:
-            st.caption("2. **Investigate Node**\nSkipped (Nominal)")
-    with wcol3:
-        if anomaly_detected:
-            st.warning("3. **Intervene Node**\nAction & Cost Formulation")
-        else:
-            st.caption("3. **Intervene Node**\nSkipped (Nominal)")
-    with wcol4:
-        st.success(f"4. **Status**\n`{status.upper()}`")
+            st.markdown(
+                f"""
+                <div class="info-card">
+                    <h4>🔍 AI Diagnostic Reasoning (Qwen 2.5)</h4>
+                    <p>{root_cause}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-    if anomaly_detected:
-        st.error("⚠️ **Grid Anomaly Detected** — Automatic Mitigations Activated")
-
-        tab_diag, tab_act, tab_logs = st.tabs(["🔍 Root Cause Diagnosis", "⚡ Proposed Intervention", "📜 Agent Message Stream"])
-
-        with tab_diag:
-            st.markdown("### LLM Diagnostic Analysis (`qwen2.5`)")
-            st.write(res.get("root_cause", "Diagnosis unavailable"))
-
-            with st.expander("Retrieved Memory Precedents (SQLite)"):
-                mems = res.get("past_interventions", [])
-                if mems:
-                    st.dataframe(pd.DataFrame(mems)[["anomaly_type", "action_taken", "outcome_score", "timestamp"]], width=800)
-                else:
-                    st.write("No prior records retrieved.")
-
-        with tab_act:
-            st.markdown("### Recommended Mitigation Plan")
-            action_data = res.get("proposed_intervention", {})
-            icol1, icol2 = st.columns([2, 1])
-            with icol1:
-                st.markdown(f"**Action:** {action_data.get('action', 'N/A')}")
-                st.markdown(f"**Expected Impact:** {action_data.get('expected_impact', 'N/A')}")
-            with icol2:
-                st.metric("Estimated Cost", f"${action_data.get('cost', 0):,.2f}")
-                if st.button("✅ Confirm & Dispatch Grid Command", type="primary"):
-                    st.balloons()
-                    st.success(f"Command dispatched to {substation} SCADA gateway!")
-
-        with tab_logs:
-            st.markdown("### Appended State Message Logs (`operator.add`)")
-            for msg in res.get("messages", []):
+            st.markdown("**Detection & Diagnostic Logs:**")
+            for msg in messages:
                 st.code(str(msg), language="markdown")
+        else:
+            st.info("✅ All metrics within normal operating envelope. No root-cause investigation required.")
 
-    else:
-        st.success("✅ **All Grid Metrics Nominal** — No human or autonomous intervention required.")
-        with st.expander("Inspection Logs"):
-            for msg in res.get("messages", []):
-                st.code(str(msg))
+    # -------------------------------------------------------------
+    # Column 3: Proposed Action & Historical Memory
+    # -------------------------------------------------------------
+    with col3:
+        st.subheader("3️⃣ Intervention & Memory")
+        if anomaly_detected:
+            action_name = proposed.get("action", "Automatic reactive adjustment")
+            cost_val = proposed.get("cost", 450.0)
+            impact_desc = proposed.get("expected_impact", "Parameter stabilization within 60s")
 
-# Historical Interventions View
+            st.markdown(
+                f"""
+                <div class="action-card">
+                    <h4>⚡ Proposed Preventive Action</h4>
+                    <p><b>Action:</b> {action_name}</p>
+                    <p><b>Est. Cost:</b> ${cost_val:,.2f}</p>
+                    <p><b>Expected Impact:</b> {impact_desc}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("**🧠 Retrieved Memory Precedents (Score ≥ 0.7):**")
+            if past_actions:
+                df_past = pd.DataFrame(past_actions)
+                display_cols = [c for c in ["anomaly_type", "action_taken", "outcome_score"] if c in df_past.columns]
+                st.dataframe(df_past[display_cols], use_container_width=True)
+            else:
+                st.caption("No prior memory records found matching criteria.")
+        else:
+            st.success("System healthy. Preventive action standby.")
+
 st.divider()
-st.subheader("📚 Grid Memory: Historical Interventions (SQLite)")
-past_records = get_past_interventions("voltage_sag", limit=10)
-if past_records:
-    df_history = pd.DataFrame(past_records)
-    st.dataframe(
-        df_history[["id", "anomaly_type", "action_taken", "outcome_score", "timestamp"]],
-        width=1000,
-    )
-else:
-    st.info("No historical intervention records found.")
+
+# -------------------------------------------------------------
+# Expandable Section: Raw SQLite Database Entries
+# -------------------------------------------------------------
+with st.expander("🗄️ Raw SQLite Database Entries (interventions.db)", expanded=False):
+    st.markdown("Direct read of persistent table `intervention_memory`:")
+    raw_records = get_raw_database_entries()
+    if raw_records:
+        df_raw = pd.DataFrame(raw_records)
+        st.dataframe(
+            df_raw[["id", "anomaly_type", "action_taken", "outcome_score", "timestamp"]],
+            use_container_width=True,
+        )
+        st.caption(f"Total historical intervention records in SQLite: {len(raw_records)}")
+    else:
+        st.info("No records present in interventions.db.")
