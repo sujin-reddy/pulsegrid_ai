@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 from typing import Any, Dict, Literal
 
 from langgraph.graph import END, StateGraph
 
-from nodes import investigate_node, intervene_node, monitor_node
+from nodes import investigation_node, monitoring_node, preventive_intervention_node
 from state import AgentState
 
 
@@ -22,9 +24,9 @@ def build_pulsegrid_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
 
     # Register workflow nodes
-    workflow.add_node("monitor", monitor_node)
-    workflow.add_node("investigate", investigate_node)
-    workflow.add_node("intervene", intervene_node)
+    workflow.add_node("monitor", monitoring_node)
+    workflow.add_node("investigate", investigation_node)
+    workflow.add_node("intervene", preventive_intervention_node)
 
     # Set workflow entry point
     workflow.set_entry_point("monitor")
@@ -50,8 +52,8 @@ def build_pulsegrid_graph() -> StateGraph:
 pulsegrid_app = build_pulsegrid_graph()
 
 
-def run_pulsegrid_workflow(telemetry: Dict[str, Any]) -> AgentState:
-    """Execute the full workflow for an incoming telemetry snapshot."""
+async def arun_pulsegrid_workflow(telemetry: Dict[str, Any]) -> AgentState:
+    """Asynchronously execute the full workflow for an incoming telemetry snapshot."""
     initial_state: AgentState = {
         "messages": [f"Initiating PulseGrid cycle for substation {telemetry.get('substation_id', 'UNKNOWN')}"],
         "telemetry_data": telemetry,
@@ -61,8 +63,23 @@ def run_pulsegrid_workflow(telemetry: Dict[str, Any]) -> AgentState:
         "past_interventions": [],
         "status": "monitoring",
     }
-    final_state = pulsegrid_app.invoke(initial_state)
+    final_state = await pulsegrid_app.ainvoke(initial_state)
     return final_state
+
+
+def run_pulsegrid_workflow(telemetry: Dict[str, Any]) -> AgentState:
+    """Synchronously execute the full workflow (handles running event loops cleanly)."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(asyncio.run, arun_pulsegrid_workflow(telemetry))
+            return future.result()
+    else:
+        return asyncio.run(arun_pulsegrid_workflow(telemetry))
 
 
 if __name__ == "__main__":
