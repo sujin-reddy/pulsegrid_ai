@@ -4,6 +4,14 @@ import operator
 from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 
 
+class TelemetryPayload(TypedDict, total=False):
+    """Generic, domain-agnostic telemetry payload."""
+    domain: str           # e.g. "energy_grid", "datacenter", "water_env"
+    device_id: str        # replaces substation_id, generic across domains
+    metrics: Dict[str, float]  # e.g. {"temperature_c": 84.0, "voltage_kv": 213.5}
+    unit_map: Dict[str, str]   # e.g. {"temperature_c": "°C"}
+
+
 class ProposedIntervention(TypedDict, total=False):
     """Schema for a proposed grid intervention action."""
     action: str
@@ -20,7 +28,7 @@ class AgentState(TypedDict, total=False):
 
     Attributes:
         messages: List of messages/logs appended via operator.add reducer across nodes.
-        telemetry_data: Dict containing sensor/time-series reading.
+        telemetry_data: Dict containing sensor/time-series reading (legacy or TelemetryPayload).
         anomaly_detected: Bool flag indicating whether an anomaly was detected.
         root_cause: Str explanation of the diagnosed issue.
         proposed_intervention: Dict containing intervention details (action, cost, expected_impact).
@@ -37,4 +45,5 @@ class AgentState(TypedDict, total=False):
     status: Literal["monitoring", "investigating", "intervening", "complete"] | str
 
 
-__all__ = ["AgentState", "ProposedIntervention", "WorkflowStatus"]
+__all__ = ["AgentState", "ProposedIntervention", "TelemetryPayload", "WorkflowStatus"]
+

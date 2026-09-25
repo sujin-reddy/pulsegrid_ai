@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from db_memory import get_past_interventions, save_intervention
-from state import AgentState, ProposedIntervention
+from state import AgentState, ProposedIntervention, TelemetryPayload
 
 logger = logging.getLogger("pulsegrid.nodes")
 
@@ -23,17 +23,75 @@ def _get_llm(model_name: str = "qwen2.5") -> ChatOllama:
     return ChatOllama(model=model_name, temperature=0.2)
 
 
+def _normalize_telemetry(telemetry: Dict[str, Any]) -> TelemetryPayload:
+    """Normalize incoming telemetry dictionary to a generic TelemetryPayload.
+
+    - If incoming dict already has "domain" and "metrics", pass through.
+    - Else (legacy grid-only dict with substation_id, voltage_kv, etc.), wrap it:
+      domain="energy_grid", device_id=telemetry.get("substation_id", "UNKNOWN"),
+      metrics = every numeric key except substation_id.
+    """
+    if not isinstance(telemetry, dict):
+        return {
+            "domain": "energy_grid",
+            "device_id": "UNKNOWN",
+            "metrics": {},
+            "unit_map": {},
+        }
+
+    if "domain" in telemetry and "metrics" in telemetry and isinstance(telemetry["metrics"], dict):
+        device_id = str(telemetry.get("device_id", telemetry.get("substation_id", "UNKNOWN")))
+        raw_metrics = telemetry.get("metrics", {})
+        metrics = {
+            str(k): float(v)
+            for k, v in raw_metrics.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+        unit_map = (
+            {str(k): str(v) for k, v in telemetry.get("unit_map", {}).items()}
+            if isinstance(telemetry.get("unit_map"), dict)
+            else {}
+        )
+        return {
+            "domain": str(telemetry["domain"]),
+            "device_id": device_id,
+            "metrics": metrics,
+            "unit_map": unit_map,
+        }
+
+    device_id = str(telemetry.get("substation_id", telemetry.get("device_id", "UNKNOWN")))
+    metrics = {
+        str(k): float(v)
+        for k, v in telemetry.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in ("substation_id", "device_id", "domain")
+    }
+    unit_map = (
+        {str(k): str(v) for k, v in telemetry.get("unit_map", {}).items()}
+        if isinstance(telemetry.get("unit_map"), dict)
+        else {}
+    )
+    return {
+        "domain": "energy_grid",
+        "device_id": device_id,
+        "metrics": metrics,
+        "unit_map": unit_map,
+    }
+
+
 def _extract_anomaly_type(telemetry: Dict[str, Any]) -> str:
     """Derive standard anomaly category tag from telemetry values."""
-    if "temperature_c" in telemetry and float(telemetry["temperature_c"]) > 80:
+    if not isinstance(telemetry, dict):
+        return "general_anomaly"
+    metrics = telemetry.get("metrics") if isinstance(telemetry.get("metrics"), dict) else telemetry
+    if "temperature_c" in metrics and float(metrics["temperature_c"]) > 80:
         return "thermal_overload"
-    if "voltage_kv" in telemetry and (float(telemetry["voltage_kv"]) < 218.5 or float(telemetry.get("power_factor", 1.0)) < 0.90):
+    if "voltage_kv" in metrics and (float(metrics["voltage_kv"]) < 218.5 or float(metrics.get("power_factor", 1.0)) < 0.90):
         return "voltage_sag"
-    if "frequency_hz" in telemetry and float(telemetry["frequency_hz"]) < 59.80:
+    if "frequency_hz" in metrics and float(metrics["frequency_hz"]) < 59.80:
         return "frequency_decay"
-    if "load_mw" in telemetry and float(telemetry["load_mw"]) > 165.0:
+    if "load_mw" in metrics and float(metrics["load_mw"]) > 165.0:
         return "thermal_overload"
-    if "value" in telemetry and float(telemetry["value"]) > 80:
+    if "value" in metrics and float(metrics["value"]) > 80:
         return "threshold_exceeded"
     return "general_anomaly"
 
@@ -43,21 +101,23 @@ def _extract_anomaly_type(telemetry: Dict[str, Any]) -> str:
 # =====================================================================
 async def monitoring_node(state: AgentState) -> Dict[str, Any]:
     """Node 1: Monitor telemetry data and detect threshold violations."""
-    telemetry = state.get("telemetry_data") or {}
+    raw_telemetry = state.get("telemetry_data") or {}
+    normalized = _normalize_telemetry(raw_telemetry)
+    metrics = normalized.get("metrics", {})
 
     anomaly_detected = False
     violations: List[str] = []
 
     # Check generic 'value' key if present (e.g. value > 80)
-    if "value" in telemetry:
-        val = float(telemetry["value"])
+    if "value" in metrics:
+        val = float(metrics["value"])
         if val > 80:
             anomaly_detected = True
             violations.append(f"Metric value {val:.1f} exceeded threshold 80")
 
     # Also check standard grid telemetry metrics if present
-    if "voltage_kv" in telemetry:
-        v_kv = float(telemetry["voltage_kv"])
+    if "voltage_kv" in metrics:
+        v_kv = float(metrics["voltage_kv"])
         if v_kv < 218.5:
             anomaly_detected = True
             violations.append(f"Undervoltage sag: {v_kv:.1f} kV (< 218.5 kV)")
@@ -65,26 +125,26 @@ async def monitoring_node(state: AgentState) -> Dict[str, Any]:
             anomaly_detected = True
             violations.append(f"Overvoltage surge: {v_kv:.1f} kV (> 241.5 kV)")
 
-    if "temperature_c" in telemetry:
-        temp_c = float(telemetry["temperature_c"])
+    if "temperature_c" in metrics:
+        temp_c = float(metrics["temperature_c"])
         if temp_c > 80.0:
             anomaly_detected = True
             violations.append(f"Core temperature alarm: {temp_c:.1f}°C (> 80.0°C)")
 
-    if "frequency_hz" in telemetry:
-        f_hz = float(telemetry["frequency_hz"])
+    if "frequency_hz" in metrics:
+        f_hz = float(metrics["frequency_hz"])
         if f_hz < 59.80:
             anomaly_detected = True
             violations.append(f"Frequency decay: {f_hz:.2f} Hz (< 59.80 Hz)")
 
-    if "load_mw" in telemetry:
-        load_mw = float(telemetry["load_mw"])
+    if "load_mw" in metrics:
+        load_mw = float(metrics["load_mw"])
         if load_mw > 165.0:
             anomaly_detected = True
             violations.append(f"Feeder capacity overload: {load_mw:.1f} MW (> 165.0 MW)")
 
-    if "power_factor" in telemetry:
-        pf = float(telemetry["power_factor"])
+    if "power_factor" in metrics:
+        pf = float(metrics["power_factor"])
         if pf < 0.90:
             anomaly_detected = True
             violations.append(f"Reactive deficit PF: {pf:.2f} (< 0.90)")
@@ -236,11 +296,14 @@ async def preventive_intervention_node(state: AgentState) -> Dict[str, Any]:
                 "expected_impact": f"Replicate verified historical mitigation (past score: {best_precedent.get('outcome_score', 0.9):.2f})",
             }
 
+    domain = telemetry.get("domain", "energy_grid") if isinstance(telemetry, dict) else "energy_grid"
+
     # Log proposed intervention to db_memory.py with save_intervention()
     save_intervention(
         anomaly_type=anomaly_type,
         action_taken=proposed_plan["action"],
         outcome_score=0.95,
+        domain=domain,
     )
 
     log_msg = (
