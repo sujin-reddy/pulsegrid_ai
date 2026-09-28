@@ -8,7 +8,12 @@ from typing import Any, Dict, Literal
 
 from langgraph.graph import END, StateGraph
 
-from nodes import investigation_node, monitoring_node, preventive_intervention_node
+from nodes import (
+    domain_router_node,
+    investigation_node,
+    monitoring_node,
+    preventive_intervention_node,
+)
 from state import AgentState
 
 
@@ -24,12 +29,16 @@ def build_pulsegrid_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
 
     # Register workflow nodes
+    workflow.add_node("domain_router", domain_router_node)
     workflow.add_node("monitor", monitoring_node)
     workflow.add_node("investigate", investigation_node)
     workflow.add_node("intervene", preventive_intervention_node)
 
-    # Set workflow entry point
-    workflow.set_entry_point("monitor")
+    # Set workflow entry point to domain_router
+    workflow.set_entry_point("domain_router")
+
+    # Connect domain_router to monitor
+    workflow.add_edge("domain_router", "monitor")
 
     # Conditional routing from monitor node
     workflow.add_conditional_edges(
@@ -54,9 +63,11 @@ pulsegrid_app = build_pulsegrid_graph()
 
 async def arun_pulsegrid_workflow(telemetry: Dict[str, Any]) -> AgentState:
     """Asynchronously execute the full workflow for an incoming telemetry snapshot."""
+    device_name = telemetry.get("substation_id", telemetry.get("device_id", "UNKNOWN"))
     initial_state: AgentState = {
-        "messages": [f"Initiating PulseGrid cycle for substation {telemetry.get('substation_id', 'UNKNOWN')}"],
+        "messages": [f"Initiating PulseGrid cycle for device/substation {device_name}"],
         "telemetry_data": telemetry,
+        "resolved_domain": "",
         "anomaly_detected": False,
         "root_cause": "",
         "proposed_intervention": {},

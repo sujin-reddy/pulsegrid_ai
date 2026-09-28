@@ -29,6 +29,7 @@ class AgentState(TypedDict, total=False):
     Attributes:
         messages: List of messages/logs appended via operator.add reducer across nodes.
         telemetry_data: Dict containing sensor/time-series reading (legacy or TelemetryPayload).
+        resolved_domain: Str identifier of the resolved operational domain.
         anomaly_detected: Bool flag indicating whether an anomaly was detected.
         root_cause: Str explanation of the diagnosed issue.
         proposed_intervention: Dict containing intervention details (action, cost, expected_impact).
@@ -38,6 +39,7 @@ class AgentState(TypedDict, total=False):
 
     messages: Annotated[List[Any], operator.add]
     telemetry_data: Dict[str, Any]
+    resolved_domain: str
     anomaly_detected: bool
     root_cause: str
     proposed_intervention: Dict[str, Any]

@@ -8,7 +8,12 @@ from typing import Any, Dict, Literal
 
 from langgraph.graph import END, StateGraph
 
-from nodes import investigation_node, monitoring_node, preventive_intervention_node
+from nodes import (
+    domain_router_node,
+    investigation_node,
+    monitoring_node,
+    preventive_intervention_node,
+)
 from state import AgentState
 
 
@@ -26,15 +31,19 @@ def check_anomaly_condition(state: AgentState) -> Literal["investigate", "__end_
 # 1. Instantiate StateGraph with shared AgentState
 workflow = StateGraph(AgentState)
 
-# 2. Add nodes: monitor, investigate, intervene
+# 2. Add nodes: domain_router, monitor, investigate, intervene
+workflow.add_node("domain_router", domain_router_node)
 workflow.add_node("monitor", monitoring_node)
 workflow.add_node("investigate", investigation_node)
 workflow.add_node("intervene", preventive_intervention_node)
 
-# 3. Set entry point to monitor
-workflow.set_entry_point("monitor")
+# 3. Set entry point to domain_router
+workflow.set_entry_point("domain_router")
 
-# 4. Add conditional edge from monitor
+# 4. Add edge from domain_router to monitor
+workflow.add_edge("domain_router", "monitor")
+
+# 5. Add conditional edge from monitor
 workflow.add_conditional_edges(
     "monitor",
     check_anomaly_condition,
@@ -44,11 +53,11 @@ workflow.add_conditional_edges(
     },
 )
 
-# 5. Add direct edges: investigate -> intervene -> END
+# 6. Add direct edges: investigate -> intervene -> END
 workflow.add_edge("investigate", "intervene")
 workflow.add_edge("intervene", END)
 
-# 6. Compile the graph into app_graph
+# 7. Compile the graph into app_graph
 app_graph = workflow.compile()
 
 
@@ -57,6 +66,7 @@ async def arun_pipeline(input_telemetry: Dict[str, Any]) -> AgentState:
     initial_state: AgentState = {
         "messages": [f"[START] Initializing PulseGrid pipeline execution."],
         "telemetry_data": input_telemetry,
+        "resolved_domain": "",
         "anomaly_detected": False,
         "root_cause": "",
         "proposed_intervention": {},
@@ -76,6 +86,7 @@ def run_pipeline(input_telemetry: Dict[str, Any]) -> AgentState:
     initial_state: AgentState = {
         "messages": [f"[START] Initializing PulseGrid pipeline execution."],
         "telemetry_data": input_telemetry,
+        "resolved_domain": "",
         "anomaly_detected": False,
         "root_cause": "",
         "proposed_intervention": {},

@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
 from db_memory import get_past_interventions, save_intervention
+from domain_config import DOMAIN_REGISTRY, DomainClassification, get_domain_config
 from state import AgentState, ProposedIntervention, TelemetryPayload
 
 logger = logging.getLogger("pulsegrid.nodes")
@@ -26,10 +27,10 @@ def _get_llm(model_name: str = "qwen2.5") -> ChatOllama:
 def _normalize_telemetry(telemetry: Dict[str, Any]) -> TelemetryPayload:
     """Normalize incoming telemetry dictionary to a generic TelemetryPayload.
 
-    - If incoming dict already has "domain" and "metrics", pass through.
-    - Else (legacy grid-only dict with substation_id, voltage_kv, etc.), wrap it:
+    - If incoming dict has "metrics" dict, extract numeric metrics from it.
+    - Else (legacy flat grid-only dict with substation_id, voltage_kv, etc.), wrap it:
       domain="energy_grid", device_id=telemetry.get("substation_id", "UNKNOWN"),
-      metrics = every numeric key except substation_id.
+      metrics = every numeric key except substation_id / device_id / domain.
     """
     if not isinstance(telemetry, dict):
         return {
@@ -39,39 +40,30 @@ def _normalize_telemetry(telemetry: Dict[str, Any]) -> TelemetryPayload:
             "unit_map": {},
         }
 
-    if "domain" in telemetry and "metrics" in telemetry and isinstance(telemetry["metrics"], dict):
-        device_id = str(telemetry.get("device_id", telemetry.get("substation_id", "UNKNOWN")))
-        raw_metrics = telemetry.get("metrics", {})
-        metrics = {
-            str(k): float(v)
-            for k, v in raw_metrics.items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-        }
-        unit_map = (
-            {str(k): str(v) for k, v in telemetry.get("unit_map", {}).items()}
-            if isinstance(telemetry.get("unit_map"), dict)
-            else {}
-        )
-        return {
-            "domain": str(telemetry["domain"]),
-            "device_id": device_id,
-            "metrics": metrics,
-            "unit_map": unit_map,
-        }
-
-    device_id = str(telemetry.get("substation_id", telemetry.get("device_id", "UNKNOWN")))
-    metrics = {
-        str(k): float(v)
-        for k, v in telemetry.items()
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in ("substation_id", "device_id", "domain")
-    }
+    domain = str(telemetry.get("domain", "energy_grid"))
+    device_id = str(telemetry.get("device_id", telemetry.get("substation_id", "UNKNOWN")))
     unit_map = (
         {str(k): str(v) for k, v in telemetry.get("unit_map", {}).items()}
         if isinstance(telemetry.get("unit_map"), dict)
         else {}
     )
+
+    if "metrics" in telemetry and isinstance(telemetry["metrics"], dict):
+        raw_metrics = telemetry["metrics"]
+        metrics = {
+            str(k): float(v)
+            for k, v in raw_metrics.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        }
+    else:
+        metrics = {
+            str(k): float(v)
+            for k, v in telemetry.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in ("substation_id", "device_id", "domain")
+        }
+
     return {
-        "domain": "energy_grid",
+        "domain": domain,
         "device_id": device_id,
         "metrics": metrics,
         "unit_map": unit_map,
@@ -97,57 +89,161 @@ def _extract_anomaly_type(telemetry: Dict[str, Any]) -> str:
 
 
 # =====================================================================
+# Node 0: Domain Router Node
+# =====================================================================
+async def domain_router_node(state: AgentState) -> Dict[str, Any]:
+    """Node 0: Route incoming telemetry to the appropriate operating domain.
+
+    Resolution order:
+      a. FAST PATH (fast-tag): Explicit 'domain' key in payload matching DOMAIN_REGISTRY.
+      b. FAST PATH (fast-alias): device_id or metric keys match tag_aliases.
+      c. LLM FALLBACK (llm-fallback): Structured output classification via Qwen 2.5.
+      d. DEFAULT (default): Fallback to 'energy_grid' with warning log.
+    """
+    raw_telemetry = state.get("telemetry_data") or {}
+    resolved: str | None = None
+    path_used: str = "default"
+    log_msg: str = ""
+
+    # a. FAST PATH: explicit domain key matching DOMAIN_REGISTRY id
+    if "domain" in raw_telemetry and str(raw_telemetry["domain"]).strip().lower() in DOMAIN_REGISTRY:
+        resolved = str(raw_telemetry["domain"]).strip().lower()
+        path_used = "fast-tag"
+        log_msg = f"[DOMAIN_ROUTER] [FAST-PATH: fast-tag] Telemetry payload explicitly specifies domain: '{resolved}'."
+
+    # b. FAST PATH: check payload keys/device_id against domain tag_aliases
+    if not resolved:
+        device_id = str(raw_telemetry.get("device_id", raw_telemetry.get("substation_id", ""))).lower()
+        if "metrics" in raw_telemetry and isinstance(raw_telemetry["metrics"], dict):
+            metric_keys = [str(k).lower() for k in raw_telemetry["metrics"].keys()]
+        else:
+            metric_keys = [str(k).lower() for k in raw_telemetry.keys() if k not in ("substation_id", "device_id", "domain")]
+
+        search_tokens = [device_id] + metric_keys
+        combined_search = f"{device_id} {' '.join(metric_keys)}"
+
+        for domain_id, config in DOMAIN_REGISTRY.items():
+            for alias in config.tag_aliases:
+                alias_lower = alias.lower()
+                if any(alias_lower in tok for tok in search_tokens) or (alias_lower in combined_search):
+                    resolved = domain_id
+                    path_used = "fast-alias"
+                    log_msg = f"[DOMAIN_ROUTER] [FAST-PATH: fast-alias] Matched tag alias '{alias}' in device/metrics; routed to domain: '{resolved}'."
+                    break
+            if resolved:
+                break
+
+    # c. LLM FALLBACK: call LLM once with DomainClassification structured output
+    if not resolved:
+        try:
+            llm = _get_llm(model_name="qwen2.5")
+            structured_llm = llm.with_structured_output(DomainClassification)
+            prompt = (
+                f"Analyze this telemetry packet metadata and classify it into the best operating domain:\n"
+                f"Device ID: {raw_telemetry.get('device_id', raw_telemetry.get('substation_id', 'UNKNOWN'))}\n"
+                f"Payload Content: {raw_telemetry}\n"
+                f"Candidate domains: {list(DOMAIN_REGISTRY.keys())}"
+            )
+            res: DomainClassification = await structured_llm.ainvoke(prompt)
+            if res and res.domain_id in DOMAIN_REGISTRY:
+                resolved = res.domain_id
+                path_used = "llm-fallback"
+                log_msg = f"[DOMAIN_ROUTER] [FALLBACK: llm-fallback] Classified by Qwen 2.5 as '{resolved}' (confidence: {res.confidence:.2f})."
+            else:
+                raise ValueError(f"Unknown domain returned by LLM: {res}")
+        except Exception as exc:
+            resolved = "energy_grid"
+            path_used = "default"
+            log_msg = f"[DOMAIN_ROUTER] [WARNING: default] LLM domain classification failed ({exc}); defaulted to '{resolved}'."
+
+    if not resolved:
+        resolved = "energy_grid"
+        path_used = "default"
+        log_msg = f"[DOMAIN_ROUTER] [WARNING: default] No match found; defaulted to '{resolved}'."
+
+    return {
+        "resolved_domain": resolved,
+        "messages": [log_msg],
+    }
+
+
+# =====================================================================
 # Node 1: Monitoring Node
 # =====================================================================
 async def monitoring_node(state: AgentState) -> Dict[str, Any]:
-    """Node 1: Monitor telemetry data and detect threshold violations."""
+    """Node 1: Monitor telemetry data and detect threshold violations based on domain_config."""
     raw_telemetry = state.get("telemetry_data") or {}
+    resolved_domain = state.get("resolved_domain") or "energy_grid"
+    domain_cfg = get_domain_config(resolved_domain)
+
     normalized = _normalize_telemetry(raw_telemetry)
+    if "domain" not in raw_telemetry:
+        normalized["domain"] = resolved_domain
+
     metrics = normalized.get("metrics", {})
+    thresholds = domain_cfg.metric_thresholds
 
     anomaly_detected = False
     violations: List[str] = []
 
-    # Check generic 'value' key if present (e.g. value > 80)
-    if "value" in metrics:
-        val = float(metrics["value"])
-        if val > 80:
-            anomaly_detected = True
-            violations.append(f"Metric value {val:.1f} exceeded threshold 80")
+    for metric_name, val in metrics.items():
+        if metric_name not in thresholds:
+            continue
+        rule = thresholds[metric_name]
+        val_float = float(val)
+        unit = rule.get("unit", "")
+        unit_str = f" {unit}" if unit and not unit.startswith("°") else unit
+        label = rule.get("label", metric_name)
+        op = rule.get("op", ">")
+        threshold_val = float(rule.get("value", 0.0))
 
-    # Also check standard grid telemetry metrics if present
-    if "voltage_kv" in metrics:
-        v_kv = float(metrics["voltage_kv"])
-        if v_kv < 218.5:
-            anomaly_detected = True
-            violations.append(f"Undervoltage sag: {v_kv:.1f} kV (< 218.5 kV)")
-        elif v_kv > 241.5:
-            anomaly_detected = True
-            violations.append(f"Overvoltage surge: {v_kv:.1f} kV (> 241.5 kV)")
+        violation_found = False
+        active_label = label
+        active_op = op
+        active_threshold = threshold_val
 
-    if "temperature_c" in metrics:
-        temp_c = float(metrics["temperature_c"])
-        if temp_c > 80.0:
-            anomaly_detected = True
-            violations.append(f"Core temperature alarm: {temp_c:.1f}°C (> 80.0°C)")
+        # Primary rule check
+        if op == ">" and val_float > threshold_val:
+            violation_found = True
+        elif op == "<" and val_float < threshold_val:
+            violation_found = True
 
-    if "frequency_hz" in metrics:
-        f_hz = float(metrics["frequency_hz"])
-        if f_hz < 59.80:
-            anomaly_detected = True
-            violations.append(f"Frequency decay: {f_hz:.2f} Hz (< 59.80 Hz)")
+        # Secondary rule check (e.g. overvoltage surge on voltage_kv)
+        if not violation_found and "secondary_op" in rule and "secondary_value" in rule:
+            sec_op = rule["secondary_op"]
+            sec_val = float(rule["secondary_value"])
+            sec_label = rule.get("secondary_label", label)
+            if sec_op == ">" and val_float > sec_val:
+                violation_found = True
+                active_label = sec_label
+                active_op = sec_op
+                active_threshold = sec_val
+            elif sec_op == "<" and val_float < sec_val:
+                violation_found = True
+                active_label = sec_label
+                active_op = sec_op
+                active_threshold = sec_val
 
-    if "load_mw" in metrics:
-        load_mw = float(metrics["load_mw"])
-        if load_mw > 165.0:
+        if violation_found:
             anomaly_detected = True
-            violations.append(f"Feeder capacity overload: {load_mw:.1f} MW (> 165.0 MW)")
-
-    if "power_factor" in metrics:
-        pf = float(metrics["power_factor"])
-        if pf < 0.90:
-            anomaly_detected = True
-            violations.append(f"Reactive deficit PF: {pf:.2f} (< 0.90)")
+            if resolved_domain == "energy_grid":
+                if metric_name == "value":
+                    violations.append(f"Metric value {val_float:.1f} exceeded threshold {int(threshold_val)}")
+                elif metric_name == "voltage_kv":
+                    violations.append(f"{active_label}: {val_float:.1f} kV ({active_op} {active_threshold:.1f} kV)")
+                elif metric_name == "temperature_c":
+                    violations.append(f"{active_label}: {val_float:.1f}°C ({active_op} {active_threshold:.1f}°C)")
+                elif metric_name == "frequency_hz":
+                    violations.append(f"{active_label}: {val_float:.2f} Hz ({active_op} {active_threshold:.2f} Hz)")
+                elif metric_name == "load_mw":
+                    violations.append(f"{active_label}: {val_float:.1f} MW ({active_op} {active_threshold:.1f} MW)")
+                elif metric_name == "power_factor":
+                    violations.append(f"{active_label}: {val_float:.2f} ({active_op} {active_threshold:.2f})")
+                else:
+                    violations.append(f"{active_label}: {val_float:.1f}{unit_str} ({active_op} {active_threshold:.1f}{unit_str})")
+            else:
+                unit_fmt = f"{unit_str}" if unit_str else ""
+                violations.append(f"{metric_name} ({active_label}): {val_float:.1f}{unit_fmt} ({active_op} {active_threshold:.1f}{unit_fmt})")
 
     if anomaly_detected:
         log_msg = f"[MONITOR] [ALERT] Anomaly detected: {'; '.join(violations)}."
@@ -326,6 +422,7 @@ investigate_node = investigation_node
 intervene_node = preventive_intervention_node
 
 __all__ = [
+    "domain_router_node",
     "monitoring_node",
     "investigation_node",
     "preventive_intervention_node",
