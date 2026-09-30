@@ -10,12 +10,14 @@ from __future__ import annotations
 import random
 import sqlite3
 import time
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from db_memory import DB_PATH, init_db
 from main import run_pipeline
+from replay import replay_csv_stream, EXAMPLE_CSV_CONTENT
 
 # Ensure database is initialized
 init_db()
@@ -168,6 +170,50 @@ st.sidebar.markdown(
     f"**History Buffer:** Last {len(st.session_state.history)} readings  \n"
     f"**Database Path:** `interventions.db`"
 )
+
+# ── CSV Replay Section ────────────────────────────────────────────────────
+st.sidebar.markdown("---")
+st.sidebar.subheader("📂 CSV Replay")
+st.sidebar.caption("Upload a telemetry CSV to replay through the pipeline.")
+
+uploaded_csv = st.sidebar.file_uploader(
+    "Upload telemetry CSV",
+    type=["csv"],
+    help="Columns: domain, device_id, + any numeric metric columns",
+    key="csv_uploader",
+)
+
+if st.sidebar.button("⬇️ Download Example CSV", use_container_width=True):
+    st.sidebar.download_button(
+        label="📥 example_telemetry.csv",
+        data=EXAMPLE_CSV_CONTENT,
+        file_name="example_telemetry.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+if uploaded_csv is not None:
+    if st.sidebar.button("▶️ Run CSV Replay", use_container_width=True):
+        import tempfile, os  # noqa: E401
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="wb") as tmp:
+            tmp.write(uploaded_csv.read())
+            tmp_path = tmp.name
+        st.subheader("📂 CSV Replay Results")
+        replay_placeholder = st.empty()
+        replay_rows = []
+        try:
+            for result in replay_csv_stream(tmp_path, run_pipeline):
+                replay_rows.append(result)
+                replay_placeholder.dataframe(
+                    pd.DataFrame(replay_rows)[
+                        ["row_index", "domain", "device_id", "anomaly_detected",
+                         "resolved_domain", "action", "cost", "latency_ms"]
+                    ],
+                    use_container_width=True,
+                )
+        finally:
+            os.unlink(tmp_path)
+        st.success(f"Replay complete — {len(replay_rows)} events processed.")
 
 # Live chart placeholder
 chart_placeholder = st.empty()
